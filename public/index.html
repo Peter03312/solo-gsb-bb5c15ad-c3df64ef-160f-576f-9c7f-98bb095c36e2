@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>字幕校订台</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <aside class="sidebar">
+    <h1>字幕校订台</h1>
+
+    <section class="card">
+      <h2>上传 SRT</h2>
+      <form id="upload-form">
+        <label>作品标题
+          <input type="text" id="work-title" maxlength="200" placeholder="例如：第七场 放映版" required />
+        </label>
+        <label>SRT 文件（UTF-8）
+          <input type="file" id="srt-file" accept=".srt,text/plain" required />
+        </label>
+        <button type="submit" class="primary">上传并校验</button>
+        <p id="upload-msg" class="msg" role="status"></p>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>校订人署名</h2>
+      <input type="text" id="editor-name" maxlength="80" placeholder="选填，随修改记录" />
+    </section>
+
+    <section class="card">
+      <h2>作品列表</h2>
+      <ul id="work-list" class="work-list"></ul>
+      <button id="refresh-list" class="linklike">刷新列表</button>
+    </section>
+  </aside>
+
+  <main class="main">
+    <div id="work-view" hidden>
+      <header class="work-header">
+        <div>
+          <h2 id="work-title-display"></h2>
+          <p class="meta">
+            <span id="work-filename"></span>
+            · 修订号 <strong id="work-revision"></strong>
+            · <span id="cue-count"></span> 段
+            · 更新于 <span id="work-updated"></span>
+          </p>
+        </div>
+        <div class="actions">
+          <button id="reload-work" title="重新拉取最新修订">重新载入</button>
+          <a id="export-link" class="button" href="#" download>导出标准 SRT</a>
+          <button id="delete-work" class="danger">删除作品</button>
+        </div>
+      </header>
+
+      <div id="stale-banner" class="banner warn" hidden>
+        其他校订人刚提交了修改（最新修订号 <strong id="stale-rev"></strong>）。
+        你正在编辑的内容不会被自动覆盖，请先
+        <button id="stale-reload" class="linklike">重新载入查看最新版本</button>，
+        未保存的修改请人工对照后重试。
+      </div>
+
+      <p class="hint">时间格式 <code>HH:MM:SS,mmm</code>；相邻字幕首尾可以相接，但不能交叠。文字支持多行换行。「保存」直接改正式段；「提候选」把本行修改送入待审区，由审阅人采纳或驳回。</p>
+
+      <section id="shift-bar" class="shift-bar">
+        <label class="shift-check"><input type="checkbox" id="shift-select-all" /> 全选</label>
+        <label class="shift-offset">整体偏移（毫秒，有符号整数）
+          <input type="text" id="shift-offset" placeholder="例如 -500 或 120" spellcheck="false" />
+        </label>
+        <button id="shift-preview-btn" type="button">预览调整</button>
+        <span id="shift-count" class="shift-count">已选 0 段</span>
+      </section>
+
+      <section id="shift-panel" class="shift-panel" hidden>
+        <div class="shift-panel-head">
+          <h3>批量平移预览</h3>
+          <div class="shift-panel-actions">
+            <span id="shift-preview-rev" class="shift-rev"></span>
+            <button id="shift-confirm-btn" type="button" class="primary">确认应用</button>
+            <button id="shift-cancel-btn" type="button">放弃预览</button>
+          </div>
+        </div>
+        <p id="shift-summary" class="shift-summary"></p>
+        <div class="shift-table-wrap">
+          <table id="shift-preview-table">
+            <thead>
+              <tr>
+                <th class="col-idx">#</th>
+                <th>调整前</th>
+                <th>调整后</th>
+                <th>碰撞对象 / 问题</th>
+              </tr>
+            </thead>
+            <tbody id="shift-preview-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="proposal-bar" class="proposal-bar">
+        <button id="proposal-toggle" type="button">
+          待审区（<span id="proposal-count">0</span> 条待审）
+        </button>
+        <label class="proposal-show-closed">
+          <input type="checkbox" id="proposal-show-closed" /> 显示已结案
+        </label>
+        <button id="proposal-refresh" type="button" class="linklike">刷新</button>
+        <span class="hint-inline">候选修改先进入待审区，采纳后才写入正式段</span>
+      </section>
+
+      <section id="proposal-panel" class="proposal-panel" hidden>
+        <div class="proposal-panel-head">
+          <h3>候选修改待审区</h3>
+          <p class="hint">
+            并列对照「原值（提交时快照）/ 候选值 / 当前正式值」。采纳会校验目标段未被他人改动、
+            候选时间合法且不与其它段交叠，成功后修订号 +1 并重排序号；目标已变或会交叠时提案保留待审。
+          </p>
+        </div>
+        <p id="proposal-msg" class="msg" role="status"></p>
+        <div class="proposal-table-wrap">
+          <table id="proposal-table">
+            <thead>
+              <tr>
+                <th class="col-idx">段</th>
+                <th class="col-prop-meta">提交者 / 说明</th>
+                <th>原值（快照）</th>
+                <th>候选值</th>
+                <th>当前正式值</th>
+                <th class="col-prop-actions">操作</th>
+              </tr>
+            </thead>
+            <tbody id="proposal-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+              <div class="table-wrap">
+        <table id="cue-table">
+          <thead>
+            <tr>
+              <th class="col-pick"></th>
+              <th class="col-idx">#</th>
+              <th class="col-time">开始</th>
+              <th class="col-time">结束</th>
+              <th>字幕文字（可多行）</th>
+              <th class="col-save"></th>
+            </tr>
+          </thead>
+          <tbody id="cue-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div id="empty-view" class="empty">
+      <p>从左侧选择一部作品，或上传一份 UTF-8 编码的 SRT 开始校订。</p>
+    </div>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

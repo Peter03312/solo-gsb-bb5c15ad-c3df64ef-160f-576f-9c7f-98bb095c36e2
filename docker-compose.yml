@@ -1,0 +1,25 @@
+# 一键启动：安装依赖在镜像构建阶段完成；
+# 首次启动时应用自动初始化 SQLite 存储（建库、建表）。
+services:
+  srt-collab:
+    build: .
+    image: srt-collab:latest
+    container_name: srt-collab
+    ports:
+      - "${HOST_PORT:-3000}:3000"
+    environment:
+      # 容器内监听端口（改这个需同步调整左侧端口映射右侧）
+      PORT: "3000"
+      DB_PATH: "/data/subtitles.db"
+    volumes:
+      - srt-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/works').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  srt-data:

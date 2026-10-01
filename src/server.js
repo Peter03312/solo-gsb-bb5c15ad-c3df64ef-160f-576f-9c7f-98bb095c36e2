@@ -18,6 +18,13 @@ const {
   serializeSrt,
 } = require('./srt');
 const { planShift } = require('./shift');
+const {
+  ReviewPackageError,
+  newPackageId,
+  parseReviewPackage,
+  planReview,
+  serializeReviewPackage,
+} = require('./review');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'subtitles.db');
@@ -850,6 +857,374 @@ app.get('/api/works/:id/export', (req, res, next) => {
 });
 
 /* ------------------------------------------------------------------ */
+/* 离线校订包：发包 / 下载 / 列表 / 预览 / 确认应用                    */
+/* ------------------------------------------------------------------ */
+
+/** 校订包元数据对外视图 */
+function reviewPackageRow(row) {
+  return {
+    id: row.id,
+    package_id: row.package_uid,
+    work_id: row.work_id,
+    base_revision: row.base_revision,
+    editor: row.editor,
+    status: row.status, // issued / used
+    cue_count: row.cue_count,
+    created_at: row.created_at,
+    used_at: row.used_at,
+  };
+}
+
+/** 取作品的全部正式段（应用预案/确认事务共用） */
+function loadCurrentCues(workId) {
+  return db
+    .prepare('SELECT * FROM cues WHERE work_id = ? ORDER BY idx, id')
+    .all(workId);
+}
+
+/** 取包内留存的发包基线 */
+function loadBaselines(packageDbId) {
+  return db
+    .prepare(
+      `SELECT cue_id, start_ms, end_ms, text FROM review_baselines
+        WHERE package_id = ? ORDER BY cue_id`
+    )
+    .all(packageDbId);
+}
+
+/**
+ * 按路径作品标识与包标识定位校订包，并核对包确实属于该作品。
+ * 找不到 -> 404 package_not_found；属于别的作品 -> 400 cross_work_package。
+ */
+function getPackageForWork(workId, uid) {
+  const pkg = db.prepare('SELECT * FROM review_packages WHERE package_uid = ?').get(uid);
+  if (!pkg) {
+    throw new HttpError(404, 'package_not_found', '校订包不存在或已被删除', {
+      package_id: uid,
+    });
+  }
+  if (pkg.work_id !== workId) {
+    throw new HttpError(
+      400,
+      'cross_work_package',
+      '校订包属于其他作品，不能导入当前作品；请在对应作品页面导入',
+      { package_id: uid, package_work_id: pkg.work_id, work_id: workId }
+    );
+  }
+  return pkg;
+}
+
+/**
+ * 从请求体取出校订包文件内容并解析。
+ * 接受 {content: "<JSON 字符串>"} 或直接以内联 JSON 对象作为包体。
+ */
+function parsePackageFromBody(body) {
+  const b = body || {};
+  if (typeof b.content === 'string') {
+    return parseReviewPackage(b.content);
+  }
+  if (b.format !== undefined || b.package_id !== undefined || b.cues !== undefined) {
+    return parseReviewPackage(b);
+  }
+  throw new HttpError(400, 'invalid_package', '请求体缺少校订包内容（content 应为校订包 JSON 文本）');
+}
+
+/** 构造预览响应；packageRow 为数据库包记录行 */
+function buildPreview(workId, pkg, parsed) {
+  const currentCues = loadCurrentCues(workId);
+  const baselines = loadBaselines(pkg.id);
+  const plan = planReview({
+    currentCues,
+    baselines,
+    pkgCues: parsed.cues,
+  });
+
+  const work = db.prepare('SELECT revision FROM works WHERE id = ?').get(workId);
+  return {
+    package: {
+      ...reviewPackageRow(pkg),
+      current_revision: work.revision,
+      drifted_from_baseline: work.revision !== pkg.base_revision,
+    },
+    revision: work.revision,
+    valid: plan.valid && pkg.status === 'issued' && plan.changed_count > 0,
+    used: pkg.status !== 'issued',
+    no_changes: plan.changed_count === 0,
+    changed_count: plan.changed_count,
+    unchanged_count: plan.unchanged_count,
+    unchanged_drifted: plan.unchanged_drifted,
+    conflicts: plan.conflicts,
+    issues: plan.issues,
+    cues: plan.entries,
+  };
+}
+
+/** 1) 发包：留存基线，返回可下载的校订包 */
+app.post('/api/works/:id/review-packages', (req, res, next) => {
+  try {
+    const workId = Number(req.params.id);
+    const { editor } = req.body || {};
+    getWorkOr404(workId);
+
+    const result = db
+      .transaction((wId) => {
+        const w = db.prepare('SELECT * FROM works WHERE id = ?').get(wId);
+        if (!w) throw new HttpError(404, 'not_found', '作品不存在');
+        const cues = db
+          .prepare('SELECT * FROM cues WHERE work_id = ? ORDER BY idx, id')
+          .all(wId);
+        if (cues.length === 0) {
+          throw new HttpError(400, 'empty_work', '该作品没有任何字幕段，无法生成校订包');
+        }
+
+        const uid = newPackageId();
+        const info = db
+          .prepare(
+            `INSERT INTO review_packages
+               (package_uid, work_id, base_revision, editor, status, cue_count)
+             VALUES (?, ?, ?, ?, 'issued', ?)`
+          )
+          .run(uid, wId, w.revision, normalizeEditor(editor), cues.length);
+        const packageDbId = info.lastInsertRowid;
+
+        const insertBase = db.prepare(
+          'INSERT INTO review_baselines (package_id, cue_id, start_ms, end_ms, text) VALUES (?, ?, ?, ?, ?)'
+        );
+        for (const c of cues) {
+          insertBase.run(packageDbId, c.id, c.start_ms, c.end_ms, c.text);
+        }
+
+        const row = db.prepare('SELECT * FROM review_packages WHERE id = ?').get(packageDbId);
+        return { row, cues, revision: w.revision };
+      })
+      .immediate(workId);
+
+    const content = serializeReviewPackage({
+      package_id: result.row.package_uid,
+      work_id: workId,
+      base_revision: result.revision,
+      created_at: result.row.created_at,
+      cues: result.cues.map((c) => ({
+        cue_id: c.id,
+        start_ms: c.start_ms,
+        end_ms: c.end_ms,
+        text: c.text,
+      })),
+    });
+
+    res.status(201).json({
+      package: reviewPackageRow(result.row),
+      content,
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/** 2) 校订包列表（可按状态过滤） */
+app.get('/api/works/:id/review-packages', (req, res, next) => {
+  try {
+    const work = getWorkOr404(req.params.id);
+    const status = req.query.status;
+    let rows;
+    if (status === undefined || status === 'all') {
+      rows = db
+        .prepare('SELECT * FROM review_packages WHERE work_id = ? ORDER BY id DESC')
+        .all(work.id);
+    } else if (status === 'issued' || status === 'used') {
+      rows = db
+        .prepare('SELECT * FROM review_packages WHERE work_id = ? AND status = ? ORDER BY id DESC')
+        .all(work.id, status);
+    } else {
+      throw new HttpError(400, 'invalid_status', 'status 只能是 issued / used / all');
+    }
+    res.json({ revision: work.revision, packages: rows.map(reviewPackageRow) });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/** 3) 下载包文件（浏览器直接触发下载，离线编辑用） */
+app.get('/api/works/:id/review-packages/:uid/file', (req, res, next) => {
+  try {
+    const workId = Number(req.params.id);
+    const work = getWorkOr404(workId);
+    const pkg = getPackageForWork(workId, req.params.uid);
+    const baselines = loadBaselines(pkg.id);
+    const content = serializeReviewPackage({
+      package_id: pkg.package_uid,
+      work_id: workId,
+      base_revision: pkg.base_revision,
+      created_at: pkg.created_at,
+      cues: baselines.map((b) => ({
+        cue_id: b.cue_id,
+        start_ms: b.start_ms,
+        end_ms: b.end_ms,
+        text: b.text,
+      })),
+    });
+
+    const safeName =
+      work.title
+        .trim()
+        .replace(/[\\/:*?"<>|\x00-\x1f]/g, '_')
+        .replace(/\s+/g, ' ')
+        .slice(0, 100) || 'work';
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename*=UTF-8''${encodeURIComponent(safeName)}.review.json`
+    );
+    res.send(content);
+  } catch (e) {
+    next(e);
+  }
+});
+
+/** 4) 预览：逐段差异、目标段已变/缺失、整批应用后的负时间/无效区间/交叠 */
+app.post('/api/works/:id/review-packages/preview', (req, res, next) => {
+  try {
+    const workId = Number(req.params.id);
+    getWorkOr404(workId);
+    const parsed = parsePackageFromBody(req.body);
+
+    if (parsed.work_id !== workId) {
+      throw new HttpError(
+        400,
+        'cross_work_package',
+        '校订包属于其他作品，不能导入当前作品；请在对应作品页面导入',
+        { package_work_id: parsed.work_id, work_id: workId }
+      );
+    }
+
+    const pkg = getPackageForWork(workId, parsed.package_id);
+    res.json(buildPreview(workId, pkg, parsed));
+  } catch (e) {
+    next(e);
+  }
+});
+
+/** 5) 确认应用：单事务按最新正式段重新核对，任一冲突整包不写；成功才推进/重排/标记已用 */
+app.post('/api/works/:id/review-packages/:uid/apply', (req, res, next) => {
+  try {
+    const workId = Number(req.params.id);
+    const { editor } = req.body || {};
+    getWorkOr404(workId);
+    // 先解析包体（无效包/坏 JSON 在此 400），再核对路径与包标识
+    const parsed = parsePackageFromBody(req.body);
+    if (parsed.work_id !== workId) {
+      throw new HttpError(400, 'cross_work_package', '校订包内的作品标识与当前作品不一致', {
+        package_work_id: parsed.work_id,
+        work_id: workId,
+      });
+    }
+    // 路径上的包标识必须与文件内一致，且属于当前作品
+    getPackageForWork(workId, req.params.uid);
+    if (parsed.package_id !== req.params.uid) {
+      throw new HttpError(400, 'package_mismatch', '请求路径的包标识与校订包文件内的包标识不一致', {
+        package_id: parsed.package_id,
+      });
+    }
+
+    const outcome = db
+      .transaction((wId, uid) => {
+        // 同事务内按最新正式段重新核对
+        const pkg = db.prepare('SELECT * FROM review_packages WHERE package_uid = ?').get(uid);
+        if (!pkg) throw new HttpError(404, 'package_not_found', '校订包不存在或已被删除');
+        if (pkg.work_id !== wId) throw new HttpError(400, 'cross_work_package', '校订包属于其他作品');
+        if (pkg.status !== 'issued') {
+          return { used: true, status: pkg.status };
+        }
+
+        const w = db.prepare('SELECT * FROM works WHERE id = ?').get(wId);
+        const currentCues = loadCurrentCues(wId);
+        const baselines = loadBaselines(pkg.id);
+        const plan = planReview({ currentCues, baselines, pkgCues: parsed.cues });
+
+        if (plan.changed_count === 0) {
+          return { noChanges: true };
+        }
+        if (!plan.valid) {
+          // 任一冲突/违例：整包不写，包仍保持 issued，可修正后重新预览/确认
+          return { conflict: true, plan, revision: w.revision };
+        }
+
+        // 只写相对基线改过且核对通过的段
+        const update = db.prepare(
+          'UPDATE cues SET start_ms = ?, end_ms = ?, text = ? WHERE id = ?'
+        );
+        const baselineById = new Map(baselines.map((b) => [b.cue_id, b]));
+        const currentById = new Map(currentCues.map((c) => [c.id, c]));
+        let applied = 0;
+        for (const e of plan.entries) {
+          if (!e.changed) continue;
+          const base = baselineById.get(e.cue_id);
+          const cur = currentById.get(e.cue_id);
+          // 防御复查：plan 已保证，事务内再断言一次
+          if (!cur || cur.start_ms !== base.start_ms || cur.end_ms !== base.end_ms || cur.text !== base.text) {
+            throw new Error(`校订包应用内部错误：段 ${e.cue_id} 基线核对失败`);
+          }
+          update.run(e.candidate.start_ms, e.candidate.end_ms, e.candidate.text, e.cue_id);
+          applied++;
+        }
+
+        const nextRevision = w.revision + 1;
+        db.prepare("UPDATE works SET revision = ?, updated_at = datetime('now') WHERE id = ?")
+          .run(nextRevision, wId);
+
+        db.prepare(
+          'INSERT INTO revisions_log (work_id, revision, editor, action) VALUES (?, ?, ?, ?)'
+        ).run(wId, nextRevision, normalizeEditor(editor), `apply review package ${uid} x${applied}`);
+
+        reindexCues(wId);
+
+        db.prepare(
+          "UPDATE review_packages SET status = 'used', used_at = datetime('now') WHERE id = ?"
+        ).run(pkg.id);
+
+        const cues = db
+          .prepare('SELECT * FROM cues WHERE work_id = ? ORDER BY idx, id')
+          .all(wId)
+          .map(cueRow);
+        const usedRow = db.prepare('SELECT * FROM review_packages WHERE id = ?').get(pkg.id);
+        return { used: false, conflict: false, revision: nextRevision, cues, applied, package: usedRow };
+      })
+      .immediate(workId, req.params.uid);
+
+    if (outcome.used) {
+      throw new HttpError(409, 'package_used', '校订包已使用，不能重复确认；可重新发包后再校订', {
+        status: outcome.status,
+      });
+    }
+    if (outcome.noChanges) {
+      throw new HttpError(422, 'no_changes', '校订包中没有相对基线改过的段，未写入任何内容');
+    }
+    if (outcome.conflict) {
+      throw new HttpError(
+        409,
+        'review_conflict',
+        '确认时按最新正式段重新核对发现冲突或违例，整包未写入；修正后可重新预览',
+        {
+          revision: outcome.revision,
+          conflicts: outcome.plan.conflicts,
+          issues: outcome.plan.issues,
+          cues: outcome.plan.entries,
+        }
+      );
+    }
+
+    res.json({
+      revision: outcome.revision,
+      applied_count: outcome.applied,
+      cues: outcome.cues,
+      package: reviewPackageRow(outcome.package),
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ------------------------------------------------------------------ */
 /* 错误处理                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -860,6 +1235,16 @@ app.use((err, req, res, next) => {
       error: 'invalid_srt',
       message: err.message,
       line: err.line,
+    });
+  }
+  if (err instanceof ReviewPackageError) {
+    const extra = {};
+    if (err.field) extra.field = err.field;
+    if (err.cue_id !== undefined) extra.cue_id = err.cue_id;
+    return res.status(400).json({
+      error: 'invalid_package',
+      message: err.message,
+      ...extra,
     });
   }
   if (err instanceof HttpError) {

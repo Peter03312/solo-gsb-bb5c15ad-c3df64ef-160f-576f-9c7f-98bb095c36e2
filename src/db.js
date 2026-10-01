@@ -75,6 +75,33 @@ CREATE TABLE IF NOT EXISTS proposals (
 );
 
 CREATE INDEX IF NOT EXISTS idx_proposals_work ON proposals(work_id, status);
+
+-- 离线校订包：发包时记录作品标识、包标识与基线修订号；确认应用成功后
+-- status 变为 used（记录使用时间），重复确认必须拒绝。包不随作品修订推进
+-- 而失效：未改段即使正式段变化也不覆盖，改过的段按基线核对。
+CREATE TABLE IF NOT EXISTS review_packages (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  package_uid   TEXT NOT NULL UNIQUE,
+  work_id       INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+  base_revision INTEGER NOT NULL,
+  editor        TEXT,
+  status        TEXT NOT NULL DEFAULT 'issued', -- issued / used
+  cue_count     INTEGER NOT NULL,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  used_at       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_packages_work ON review_packages(work_id, status);
+
+-- 发包时各段基线（时间与多行文字快照），导入时只处理相对基线改过的段
+CREATE TABLE IF NOT EXISTS review_baselines (
+  package_id INTEGER NOT NULL REFERENCES review_packages(id) ON DELETE CASCADE,
+  cue_id     INTEGER NOT NULL,
+  start_ms   INTEGER NOT NULL,
+  end_ms     INTEGER NOT NULL,
+  text       TEXT NOT NULL,
+  PRIMARY KEY (package_id, cue_id)
+);
 `;
 
 function bindParams(stmt, args) {

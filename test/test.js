@@ -815,6 +815,447 @@ async function main() {
     assert.strictEqual(noWork.status, 404);
   });
 
+  /* ---------------- 离线校订包 ---------------- */
+
+  const {
+    parseReviewPackage,
+    planReview,
+    serializeReviewPackage,
+    newPackageId,
+  } = require('../src/review');
+
+  test('校订包：parseReviewPackage 拒绝非 JSON/格式/版本/字段非法', () => {
+    const expectInvalid = (input, field) => {
+      let threw = false;
+      try {
+        parseReviewPackage(input);
+      } catch (e) {
+        threw = true;
+        assert.ok(e.name === 'ReviewPackageError');
+        if (field) assert.strictEqual(e.field, field, `field 应为 ${field}，实际 ${e.field}`);
+      }
+      assert.ok(threw, '应拒绝非法校订包');
+    };
+    expectInvalid('{bad');
+    expectInvalid({ format: 'other', version: 1, work_id: 1, package_id: 'rv_abcd1234', cues: [{}] }, 'format');
+    expectInvalid({ format: 'srt-review-package', version: 9, work_id: 1, package_id: 'rv_abcd1234', cues: [] }, 'version');
+    expectInvalid({ format: 'srt-review-package', version: 1, work_id: 0, package_id: 'rv_abcd1234', cues: [] }, 'work_id');
+    expectInvalid({ format: 'srt-review-package', version: 1, work_id: 1, package_id: 'bad id', cues: [] }, 'package_id');
+    expectInvalid({ format: 'srt-review-package', version: 1, work_id: 1, package_id: 'rv_abcd1234', cues: [] });
+    expectInvalid({ format: 'srt-review-package', version: 1, work_id: 1, package_id: 'rv_abcd1234',
+      cues: [{ cue_id: 'x', start: '00:00:01,000', end: '00:00:02,000', text: 'a' }] });
+    expectInvalid({ format: 'srt-review-package', version: 1, work_id: 1, package_id: 'rv_abcd1234',
+      cues: [{ cue_id: 1, start: 'bad', end: '00:00:02,000', text: 'a' }] });
+    expectInvalid({ format: 'srt-review-package', version: 1, work_id: 1, package_id: 'rv_abcd1234',
+      cues: [{ cue_id: 1, start: '00:00:01,000', end: '00:00:02,000', text: '  ' }] });
+    // 重复段 ID
+    expectInvalid({ format: 'srt-review-package', version: 1, work_id: 1, package_id: 'rv_abcd1234',
+      cues: [
+        { cue_id: 1, start: '00:00:01,000', end: '00:00:02,000', text: 'a' },
+        { cue_id: 1, start: '00:00:03,000', end: '00:00:04,000', text: 'b' },
+      ] });
+  });
+
+  test('校订包：合法包解析，支持负时间与 text_lines', () => {
+    const parsed = parseReviewPackage({
+      format: 'srt-review-package', version: 1, work_id: 7, package_id: 'rv_abcd1234',
+      cues: [
+        { cue_id: 1, start: '-00:00:00,500', end: '00:00:01,000', text_lines: ['第一行', '第二行'] },
+      ],
+    });
+    assert.strictEqual(parsed.work_id, 7);
+    assert.strictEqual(parsed.cues[0].startMs, -500);
+    assert.strictEqual(parsed.cues[0].text, '第一行\n第二行');
+  });
+
+  test('校订包 planReview：未改段不覆盖（即使正式段已漂移）、改过段冲突/违例分类', () => {
+    // 基线：#1 1-2 甲 #2 3-4 乙 #3 5-6 丙
+    const baselines = [
+      { cue_id: 1, start_ms: 1000, end_ms: 2000, text: '甲' },
+      { cue_id: 2, start_ms: 3000, end_ms: 4000, text: '乙' },
+      { cue_id: 3, start_ms: 5000, end_ms: 6000, text: '丙' },
+    ];
+    // 正式段：#2 已被在线改成 3-3.5 乙二；#3 已被删除（缺失）
+    const currentCues = [
+      { id: 1, idx: 1, start_ms: 1000, end_ms: 2000, text: '甲' },
+      { id: 2, idx: 2, start_ms: 3000, end_ms: 3500, text: '乙二' },
+    ];
+    const parsed = parseReviewPackage({
+      format: 'srt-review-package', version: 1, work_id: 1, package_id: 'rv_abcd1234',
+      cues: [
+        { cue_id: 1, start: '00:00:01,000', end: '00:00:02,000', text: '甲改' },        // 改过，干净
+        { cue_id: 2, start: '00:00:03,000', end: '00:00:04,000', text: '乙' },          // 未改但正式段已漂移
+        { cue_id: 3, start: '00:00:05,000', end: '00:00:06,000', text: '丙改' },        // 改过但段缺失
+        { cue_id: 9, start: '00:00:01,000', end: '00:00:02,000', text: '外来' },        // 不在基线
+      ],
+    });
+    const plan = planReview({ currentCues, baselines, pkgCues: parsed.cues });
+    assert.strictEqual(plan.changed_count, 2);
+    assert.strictEqual(plan.unchanged_count, 2);
+    assert.deepStrictEqual(plan.unchanged_drifted, [2]);
+    const reasons = new Map(plan.conflicts.map((c) => [c.cue_id, c.reason]));
+    assert.strictEqual(reasons.get(3), 'target_missing');
+    assert.strictEqual(reasons.get(9), 'baseline_missing');
+    assert.strictEqual(plan.valid, false);
+  });
+
+  test('校订包 planReview：负时间/无效区间/交叠（含整批候选彼此交叠）', () => {
+    const baselines = [
+      { cue_id: 1, start_ms: 1000, end_ms: 2000, text: '甲' },
+      { cue_id: 2, start_ms: 3000, end_ms: 4000, text: '乙' },
+      { cue_id: 3, start_ms: 5000, end_ms: 6000, text: '丙' },
+    ];
+    const currentCues = baselines.map((b, i) => ({ id: b.cue_id, idx: i + 1, ...b }));
+    const mk = (cues) => planReview({
+      currentCues,
+      baselines,
+      pkgCues: parseReviewPackage({
+        format: 'srt-review-package', version: 1, work_id: 1, package_id: 'rv_abcd1234', cues,
+      }).cues,
+    });
+    // 负起点
+    let plan = mk([
+      { cue_id: 1, start: '-00:00:00,200', end: '00:00:00,500', text: '甲' },
+      { cue_id: 2, start: '00:00:03,000', end: '00:00:04,000', text: '乙' },
+      { cue_id: 3, start: '00:00:05,000', end: '00:00:06,000', text: '丙' },
+    ]);
+    assert.strictEqual(plan.issues.some((i) => i.type === 'negative_time'), true);
+    assert.strictEqual(plan.valid, false);
+    // 无效区间
+    plan = mk([
+      { cue_id: 1, start: '00:00:05,000', end: '00:00:01,000', text: '甲' },
+      { cue_id: 2, start: '00:00:03,000', end: '00:00:04,000', text: '乙' },
+      { cue_id: 3, start: '00:00:05,000', end: '00:00:06,000', text: '丙' },
+    ]);
+    assert.strictEqual(plan.issues.some((i) => i.type === 'invalid_range'), true);
+    // 与未改正式段交叠
+    plan = mk([
+      { cue_id: 1, start: '00:00:03,500', end: '00:00:04,500', text: '甲' },
+      { cue_id: 2, start: '00:00:03,000', end: '00:00:04,000', text: '乙' },
+      { cue_id: 3, start: '00:00:05,000', end: '00:00:06,000', text: '丙' },
+    ]);
+    assert.strictEqual(plan.issues.some((i) => i.type === 'overlap'), true);
+    // 两个改过的候选彼此交叠
+    plan = mk([
+      { cue_id: 1, start: '00:00:07,000', end: '00:00:08,000', text: '甲' },
+      { cue_id: 2, start: '00:00:07,500', end: '00:00:09,000', text: '乙' },
+      { cue_id: 3, start: '00:00:05,000', end: '00:00:06,000', text: '丙' },
+    ]);
+    assert.ok(plan.issues.some((i) => i.type === 'overlap'));
+    assert.strictEqual(plan.valid, false);
+    // 首尾相接允许，全部合法
+    plan = mk([
+      { cue_id: 1, start: '00:00:02,000', end: '00:00:03,000', text: '甲' },
+      { cue_id: 2, start: '00:00:03,000', end: '00:00:04,000', text: '乙' },
+      { cue_id: 3, start: '00:00:05,000', end: '00:00:06,000', text: '丙' },
+    ]);
+    assert.deepStrictEqual(plan.issues, []);
+    assert.strictEqual(plan.valid, true);
+  });
+
+  test('校订包：serializeReviewPackage 往返稳定，package_id 合法', () => {
+    const uid = newPackageId();
+    assert.match(uid, /^rv_[A-Za-z0-9_-]{4,}$/);
+    const file = serializeReviewPackage({
+      package_id: uid, work_id: 1, base_revision: 1,
+      cues: [{ cue_id: 1, start_ms: 1000, end_ms: 2000, text: '甲\n第二行' }],
+    });
+    const parsed = parseReviewPackage(file);
+    assert.strictEqual(parsed.package_id, uid);
+    assert.strictEqual(parsed.cues[0].text, '甲\n第二行');
+  });
+
+  // 新作品跑 HTTP 全流程：#1 1-2 甲 #2 3-4 乙 #3 5-6 丙
+  const REVIEW_SRT =
+    '1\n00:00:01,000 --> 00:00:02,000\n甲\n\n' +
+    '2\n00:00:03,000 --> 00:00:04,000\n乙\n\n' +
+    '3\n00:00:05,000 --> 00:00:06,000\n丙\n';
+  let reviewWorkId;
+  let rvIds = {};
+  let pkg1Content;
+  let pkg1Uid;
+
+  const patchPkg = (content, cueId, patch) => {
+    const p = JSON.parse(content);
+    const c = p.cues.find((x) => x.cue_id === cueId);
+    Object.assign(c, patch);
+    return JSON.stringify(p);
+  };
+
+  await test('校订包 HTTP：上传作品并发包，包含作品/包标识、段 ID 与多行文字，基线入库', async () => {
+    const up = await call('POST', '/api/works', { title: '离线片', filename: 'rv.srt', content: REVIEW_SRT });
+    assert.strictEqual(up.status, 201, JSON.stringify(up.json));
+    reviewWorkId = up.json.id;
+    const d = await call('GET', `/api/works/${reviewWorkId}`);
+    [1, 2, 3].forEach((i) => { rvIds[i] = byIdx(d.json.cues, i).id; });
+
+    const r = await call('POST', `/api/works/${reviewWorkId}/review-packages`, { editor: '校对甲' });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+    assert.strictEqual(r.json.package.status, 'issued');
+    assert.strictEqual(r.json.package.base_revision, 1);
+    assert.strictEqual(r.json.package.cue_count, 3);
+    pkg1Uid = r.json.package.package_id;
+    pkg1Content = r.json.content;
+    const file = JSON.parse(r.json.content);
+    assert.strictEqual(file.format, 'srt-review-package');
+    assert.strictEqual(file.work_id, reviewWorkId);
+    assert.strictEqual(file.package_id, pkg1Uid);
+    assert.deepStrictEqual(file.cues.map((c) => c.cue_id).sort(), [rvIds[1], rvIds[2], rvIds[3]].sort());
+    // 发包不推进修订号
+    const d2 = await call('GET', `/api/works/${reviewWorkId}`);
+    assert.strictEqual(d2.json.work.revision, 1);
+  });
+
+  await test('校订包 HTTP：文件下载与发包记录列表', async () => {
+    const res = await fetch(`${base}/api/works/${reviewWorkId}/review-packages/${pkg1Uid}/file`);
+    assert.strictEqual(res.status, 200);
+    assert.ok(res.headers.get('content-disposition').includes('.review.json'));
+    const file = JSON.parse(await res.text());
+    assert.strictEqual(file.package_id, pkg1Uid);
+
+    const list = await call('GET', `/api/works/${reviewWorkId}/review-packages?status=all`);
+    assert.strictEqual(list.status, 200);
+    assert.strictEqual(list.json.packages.length, 1);
+    assert.strictEqual(list.json.packages[0].package_id, pkg1Uid);
+  });
+
+  await test('校订包 HTTP：预览逐段差异，改 1 段、其余未改', async () => {
+    const content = patchPkg(pkg1Content, rvIds[1], { text: '甲离线\n第二行' });
+    const r = await call('POST', `/api/works/${reviewWorkId}/review-packages/preview`, { content });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.valid, true);
+    assert.strictEqual(r.json.changed_count, 1);
+    assert.strictEqual(r.json.unchanged_count, 2);
+    assert.deepStrictEqual(r.json.conflicts, []);
+    assert.deepStrictEqual(r.json.issues, []);
+    const e1 = r.json.cues.find((c) => c.cue_id === rvIds[1]);
+    assert.strictEqual(e1.changed, true);
+    assert.strictEqual(e1.candidate.text, '甲离线\n第二行');
+    assert.strictEqual(e1.baseline.text, '甲');
+  });
+
+  await test('校订包 HTTP：确认应用成功——只写改过的段、修订号 +1、序号重排、包标记已用', async () => {
+    // #1 移到 07-08 以触发序号重排，#2/#3 未改
+    let content = patchPkg(pkg1Content, rvIds[1], {
+      start: '00:00:07,000', end: '00:00:08,000', text: '甲离线',
+    });
+    // 同时确认多行文字也能写入
+    content = patchPkg(content, rvIds[3], { text: '丙改\n第二行' });
+    const r = await call('POST', `/api/works/${reviewWorkId}/review-packages/${pkg1Uid}/apply`, {
+      content, editor: '校对甲',
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.revision, 2);
+    assert.strictEqual(r.json.applied_count, 2);
+    // 重排：乙(3-4)、丙(5-6)、甲(7-8)
+    assert.deepStrictEqual(r.json.cues.map((c) => c.id), [rvIds[2], rvIds[3], rvIds[1]]);
+    r.json.cues.forEach((c, i) => assert.strictEqual(c.idx, i + 1));
+    const jia = r.json.cues.find((c) => c.id === rvIds[1]);
+    assert.strictEqual(jia.text, '甲离线');
+    const bing = r.json.cues.find((c) => c.id === rvIds[3]);
+    assert.strictEqual(bing.text, '丙改\n第二行');
+
+    const p = await call('GET', `/api/works/${reviewWorkId}/review-packages?status=all`);
+    assert.strictEqual(p.json.packages.find((x) => x.package_id === pkg1Uid).status, 'used');
+
+    const exp = await fetch(`${base}/api/works/${reviewWorkId}/export`);
+    const body = await exp.text();
+    assert.ok(body.includes('00:00:07,000 --> 00:00:08,000\n甲离线'));
+    assert.ok(/1\n00:00:03,000 --> 00:00:04,000\n乙/.test(body), '导出按新正式内容从 1 编号');
+  });
+
+  await test('校订包 HTTP：重复确认被拒绝（409 package_used）', async () => {
+    const r = await call('POST', `/api/works/${reviewWorkId}/review-packages/${pkg1Uid}/apply`, {
+      content: pkg1Content,
+    });
+    assert.strictEqual(r.status, 409);
+    assert.strictEqual(r.json.error, 'package_used');
+    // 已用包的预览也标出 used
+    const pv = await call('POST', `/api/works/${reviewWorkId}/review-packages/preview`, {
+      content: pkg1Content,
+    });
+    assert.strictEqual(pv.status, 200);
+    assert.strictEqual(pv.json.used, true);
+    assert.strictEqual(pv.json.valid, false);
+  });
+
+  await test('校订包 HTTP：新包针对已漂移作品——未改段保持正式值，改过且干净的段照常写入', async () => {
+    // 当前 rev2：乙 3-4、丙 5-6（丙改/第二行）、甲 7-8
+    const issue = await call('POST', `/api/works/${reviewWorkId}/review-packages`, {});
+    assert.strictEqual(issue.status, 201);
+    const uid2 = issue.json.package.package_id;
+    const base2 = issue.json.content;
+    // 离线只改乙；丙、甲未改
+    const content = patchPkg(base2, rvIds[2], { text: '乙离线' });
+    const pv = await call('POST', `/api/works/${reviewWorkId}/review-packages/preview`, { content });
+    assert.strictEqual(pv.json.valid, true);
+    assert.deepStrictEqual(pv.json.unchanged_drifted, []);
+    assert.strictEqual(pv.json.changed_count, 1);
+
+    // 他人在确认前先改了「甲」（未改段）：修订号推进，但不应影响本包应用
+    const other = await call('PUT', `/api/works/${reviewWorkId}/cues/${rvIds[1]}`, {
+      revision: 2, start: '00:00:07,000', end: '00:00:08,500', text: '甲在线改',
+    });
+    assert.strictEqual(other.status, 200, JSON.stringify(other.json));
+
+    const pv2 = await call('POST', `/api/works/${reviewWorkId}/review-packages/preview`, { content });
+    assert.strictEqual(pv2.json.valid, true, JSON.stringify(pv2.json.issues));
+    assert.deepStrictEqual(pv2.json.unchanged_drifted, [rvIds[1]]);
+
+    const r = await call('POST', `/api/works/${reviewWorkId}/review-packages/${uid2}/apply`, { content });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.revision, 4);
+    const yi = r.json.cues.find((c) => c.id === rvIds[2]);
+    assert.strictEqual(yi.text, '乙离线');
+    const jia = r.json.cues.find((c) => c.id === rvIds[1]);
+    assert.strictEqual(jia.text, '甲在线改', '未改段不应被离线包覆盖');
+  });
+
+  await test('校订包 HTTP：改过的目标段已在线变化 -> 整包不写，返回段 ID 与原因，包仍可预览', async () => {
+    const issue = await call('POST', `/api/works/${reviewWorkId}/review-packages`, {});
+    const uid3 = issue.json.package.package_id;
+    // rev4 时间线：乙 3-4 乙离线、丙 5-6 丙改/第二行、甲 7-8.5 甲在线改
+    const content = patchPkg(issue.json.content, rvIds[2], { text: '乙离线再改' });
+
+    // 他人抢先改了乙
+    const other = await call('PUT', `/api/works/${reviewWorkId}/cues/${rvIds[2]}`, {
+      revision: 4, start: '00:00:03,000', end: '00:00:04,000', text: '乙在线抢先',
+    });
+    assert.strictEqual(other.status, 200);
+
+    const pv = await call('POST', `/api/works/${reviewWorkId}/review-packages/preview`, { content });
+    assert.strictEqual(pv.json.valid, false);
+    assert.strictEqual(pv.json.conflicts[0].cue_id, rvIds[2]);
+    assert.strictEqual(pv.json.conflicts[0].reason, 'target_changed');
+
+    const ap = await call('POST', `/api/works/${reviewWorkId}/review-packages/${uid3}/apply`, { content });
+    assert.strictEqual(ap.status, 409);
+    assert.strictEqual(ap.json.error, 'review_conflict');
+    assert.strictEqual(ap.json.conflicts[0].cue_id, rvIds[2]);
+    assert.strictEqual(ap.json.conflicts[0].reason, 'target_changed');
+
+    const d = await call('GET', `/api/works/${reviewWorkId}`);
+    assert.strictEqual(d.json.work.revision, 5, '冲突整包不写，修订号不推进');
+    assert.strictEqual(byIdx(d.json.cues, 1).text, '乙在线抢先');
+
+    // 包仍是 issued，可重新预览
+    const list = await call('GET', `/api/works/${reviewWorkId}/review-packages?status=all`);
+    assert.strictEqual(list.json.packages.find((x) => x.package_id === uid3).status, 'issued');
+    const rePv = await call('POST', `/api/works/${reviewWorkId}/review-packages/preview`, { content });
+    assert.strictEqual(rePv.status, 200);
+  });
+
+  await test('校订包 HTTP：整批违例（负时间/无效区间/交叠）422 预览、确认 409 整包不写', async () => {
+    const issue = await call('POST', `/api/works/${reviewWorkId}/review-packages`, {});
+    const uid4 = issue.json.package.package_id;
+    // rev5：乙 3-4、丙 5-6、甲 7-8.5
+    const neg = patchPkg(issue.json.content, rvIds[2], { start: '-00:00:00,100', end: '00:00:00,500' });
+    const pvNeg = await call('POST', `/api/works/${reviewWorkId}/review-packages/preview`, { content: neg });
+    assert.strictEqual(pvNeg.json.valid, false);
+    assert.strictEqual(pvNeg.json.issues[0].type, 'negative_time');
+
+    const ov = patchPkg(issue.json.content, rvIds[1], {
+      start: '00:00:05,500', end: '00:00:06,500', text: '甲移到丙上',
+    });
+    const pvOv = await call('POST', `/api/works/${reviewWorkId}/review-packages/preview`, { content: ov });
+    assert.ok(pvOv.json.issues.some((i) => i.type === 'overlap'));
+    assert.ok(pvOv.json.issues[0].cue_ids.includes(rvIds[3]));
+
+    const ap = await call('POST', `/api/works/${reviewWorkId}/review-packages/${uid4}/apply`, { content: ov });
+    assert.strictEqual(ap.status, 409);
+    assert.strictEqual(ap.json.error, 'review_conflict');
+    const d = await call('GET', `/api/works/${reviewWorkId}`);
+    assert.strictEqual(d.json.work.revision, 5);
+  });
+
+  await test('校订包 HTTP：无效包/跨作品包/字段非法明确拒绝且不写入', async () => {
+    // 非 JSON 文本
+    const badJson = await call('POST', `/api/works/${reviewWorkId}/review-packages/preview`, {
+      content: '{不是合法json',
+    });
+    assert.strictEqual(badJson.status, 400, JSON.stringify(badJson.json));
+    assert.strictEqual(badJson.json.error, 'invalid_package', JSON.stringify(badJson.json));
+
+    // format 错误
+    const badFmt = await call('POST', `/api/works/${reviewWorkId}/review-packages/preview`, {
+      content: JSON.stringify({ format: 'nope', version: 1, work_id: reviewWorkId, package_id: pkg1Uid, cues: [] }),
+    });
+    assert.strictEqual(badFmt.status, 400);
+    assert.strictEqual(badFmt.json.error, 'invalid_package');
+
+    // 时间字段非法
+    const badField = await call('POST', `/api/works/${reviewWorkId}/review-packages/preview`, {
+      content: JSON.stringify({
+        format: 'srt-review-package', version: 1, work_id: reviewWorkId,
+        package_id: 'rv_abcd1234', cues: [{ cue_id: 1, start: '一秒', end: '00:00:02,000', text: 'a' }],
+      }),
+    });
+    assert.strictEqual(badField.status, 400);
+    assert.strictEqual(badField.json.error, 'invalid_package');
+
+    // 未知包标识
+    const unknown = await call('POST', `/api/works/${reviewWorkId}/review-packages/preview`, {
+      content: JSON.stringify({
+        format: 'srt-review-package', version: 1, work_id: reviewWorkId,
+        package_id: 'rv_notfound00', cues: [{ cue_id: 1, start: '00:00:01,000', end: '00:00:02,000', text: 'a' }],
+      }),
+    });
+    assert.strictEqual(unknown.status, 404);
+    assert.strictEqual(unknown.json.error, 'package_not_found');
+
+    // 跨作品：构造属于另一作品的包，发到当前作品
+    const otherUp = await call('POST', '/api/works', {
+      title: '别的片', filename: 'o.srt',
+      content: '1\n00:00:01,000 --> 00:00:02,000\nX\n',
+    });
+    const otherIssue = await call('POST', `/api/works/${otherUp.json.id}/review-packages`, {});
+    const cross = await call('POST', `/api/works/${reviewWorkId}/review-packages/preview`, {
+      content: otherIssue.json.content,
+    });
+    assert.strictEqual(cross.status, 400);
+    assert.strictEqual(cross.json.error, 'cross_work_package');
+    assert.strictEqual(cross.json.package_work_id, otherUp.json.id);
+
+    // 跨作品确认（路径 uid 属于别的作品）
+    const crossApply = await call(
+      'POST',
+      `/api/works/${reviewWorkId}/review-packages/${otherIssue.json.package.package_id}/apply`,
+      { content: otherIssue.json.content }
+    );
+    assert.strictEqual(crossApply.status, 400);
+    assert.strictEqual(crossApply.json.error, 'cross_work_package');
+
+    // 路径 uid 与文件内 package_id 不一致
+    const ownIssue = await call('POST', `/api/works/${reviewWorkId}/review-packages`, {});
+    const tampered = (() => {
+      const p = JSON.parse(ownIssue.json.content);
+      p.package_id = 'rv_tampered000';
+      return JSON.stringify(p);
+    })();
+    const mismatch = await call(
+      'POST',
+      `/api/works/${reviewWorkId}/review-packages/${ownIssue.json.package.package_id}/apply`,
+      { content: tampered }
+    );
+    assert.strictEqual(mismatch.status, 400);
+    assert.strictEqual(mismatch.json.error, 'package_mismatch');
+
+    // 非法请求不推进修订号
+    const d = await call('GET', `/api/works/${reviewWorkId}`);
+    assert.strictEqual(d.json.work.revision, 5);
+  });
+
+  await test('校订包 HTTP：无任何改动确认返回 422 no_changes', async () => {
+    const issue = await call('POST', `/api/works/${reviewWorkId}/review-packages`, {});
+    const r = await call(
+      'POST',
+      `/api/works/${reviewWorkId}/review-packages/${issue.json.package.package_id}/apply`,
+      { content: issue.json.content }
+    );
+    assert.strictEqual(r.status, 422);
+    assert.strictEqual(r.json.error, 'no_changes');
+  });
+
   await test('持久化：用 openDb 重新打开文件，数据与修订号都在', async () => {
     const { openDb } = require('../src/db');
     const db2 = await openDb(process.env.DB_PATH);

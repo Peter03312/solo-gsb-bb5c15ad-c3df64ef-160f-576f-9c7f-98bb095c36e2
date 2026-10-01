@@ -450,3 +450,135 @@ tr.closed td { background: #f6f7f9; color: var(--muted); }
   font-size: 12.5px;
 }
 .propose-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* ---------------- 离线校订包 ---------------- */
+
+.review-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 14px;
+  margin: 0 0 12px;
+}
+
+#issue-package {
+  border-color: var(--brand);
+  color: var(--brand-dark);
+}
+
+.review-panel {
+  background: var(--panel);
+  border: 1px solid var(--brand);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin: 0 0 12px;
+}
+
+.review-panel-head h3 { margin: 0 0 4px; font-size: 15px; }
+.review-panel-head .hint { margin: 0 0 6px; }
+
+.review-pick {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.review-pick label { font-size: 13px; color: var(--muted); margin: 0; }
+.review-pick input[type="file"] { width: auto; }
+.review-picked { font-size: 12.5px; color: var(--brand-dark); }
+
+.review-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+#review-apply-btn.primary { width: auto; margin: 0; }
+#review-apply-btn:disabled { opacity: 0.5; cursor: default; }
+
+.review-rev { font-size: 12.5px; color: var(--muted); }
+.review-rev.bad { color: var(--danger); }
+
+.review-summary {
+  margin: 8px 0;
+  padding: 8px 11px;
+  border-radius: 8px;
+  font-size: 13px;
+  white-space: pre-wrap;
+  border: 1px solid var(--line);
+}
+.review-summary.ok { background: var(--ok-bg); border-color: #9ed6b3; color: var(--brand-dark); }
+.review-summary.bad { background: var(--err-bg); border-color: #f3b6b0; color: var(--danger); }
+
+.review-table-wrap {
+  max-height: 420px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.review-table-wrap table { width: 100%; }
+
+.review-table-wrap td.tc {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  white-space: pre-line;
+}
+
+.prop-val .tx, .review-table-wrap .tx {
+  font-family: ui-monospace, "SFMono-Regular", Consolas, "PingFang SC", monospace;
+  font-size: 12.5px;
+  white-space: pre-wrap;
+}
+
+tr.rev-unchanged td { color: var(--muted); }
+tr.rev-ok td { background: #f6fbf8; }
+tr.rev-bad td { background: var(--err-bg); }
+tr.rev-conflict td { background: var(--warn-bg); }
+
+.rev-cell .tc { color: var(--muted); }
+.rev-cell .label { font-size: 11.5px; color: var(--muted); display: block; }
+
+.rev-badges { margin-top: 4px; }
+.rev-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  margin: 2px 4px 0 0;
+}
+.rev-badge.changed { background: #e0edff; color: #1d4ed8; }
+.rev-badge.same { background: #eef1f4; color: var(--muted); }
+.rev-badge.drifted { background: var(--warn-bg); color: var(--warn-line); }
+.rev-badge.conflict { background: var(--err-bg); color: var(--danger); }
+.rev-badge.invalid { background: var(--err-bg); color: var(--danger); }
+.rev-badge.overlap { background: var(--err-bg); color: var(--danger); }
+
+.review-history { margin-top: 10px; font-size: 12.5px; }
+.review-history summary { cursor: pointer; color: var(--muted); }
+.review-history-list { margin-top: 6px; }
+.review-history-list .rh-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 6px;
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+.rh-uid { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; color: var(--muted); }
+.rh-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11.5px;
+}
+.rh-badge.issued { background: #e0edff; color: #1d4ed8; }
+.rh-badge.used { background: #eef1f4; color: var(--muted); }
+.rh-dl { font-size: 12px; }

@@ -50,6 +50,7 @@
         </div>
         <div class="actions">
           <button id="reload-work" title="重新拉取最新修订">重新载入</button>
+          <button id="issue-package" type="button" title="下载离线校订包（含作品标识、包标识、稳定段 ID、起止时间与多行文字）">下载校订包</button>
           <a id="export-link" class="button" href="#" download>导出标准 SRT</a>
           <button id="delete-work" class="danger">删除作品</button>
         </div>
@@ -133,6 +134,55 @@
             <tbody id="proposal-tbody"></tbody>
           </table>
         </div>
+      </section>
+
+      <section id="review-bar" class="review-bar">
+        <button id="review-toggle" type="button">导入离线校订包</button>
+        <button id="review-refresh" type="button" class="linklike">刷新发包记录</button>
+        <span class="hint-inline">校订包可离线修改后回传；只应用相对发包基线改过的段，未改段不覆盖</span>
+      </section>
+
+      <section id="review-panel" class="review-panel" hidden>
+        <div class="review-panel-head">
+          <h3>离线校订包导入</h3>
+          <p class="hint">
+            选择离线改好的 <code>.review.json</code> 校订包后点「预览差异」：逐段对照基线 / 候选 / 当前正式值；
+            目标段发包后已变或已缺失、整批应用后会出现负时间、无效区间或交叠时都会标出。确认时服务器按最新
+            正式段在同一事务内重新核对，任一冲突则整包不写；成功才推进修订号、重排序号并标记包已使用
+            （同一校订包不能重复确认）。
+          </p>
+        </div>
+        <div class="review-pick">
+          <label>校订包文件（JSON）
+            <input type="file" id="review-file" accept=".json,application/json" />
+          </label>
+          <span id="review-picked" class="review-picked"></span>
+        </div>
+        <div class="review-actions">
+          <button id="review-preview-btn" type="button">预览差异</button>
+          <button id="review-apply-btn" type="button" class="primary" disabled>确认应用整包</button>
+          <button id="review-clear-btn" type="button" class="linklike">放弃</button>
+          <span id="review-rev" class="review-rev"></span>
+        </div>
+        <p id="review-msg" class="msg" role="status"></p>
+        <div class="review-summary" id="review-summary" hidden></div>
+        <div class="review-table-wrap">
+          <table id="review-table">
+            <thead>
+              <tr>
+                <th class="col-idx">段</th>
+                <th>发包基线</th>
+                <th>离线候选</th>
+                <th>当前正式值 / 问题</th>
+              </tr>
+            </thead>
+            <tbody id="review-tbody"></tbody>
+          </table>
+        </div>
+        <details class="review-history">
+          <summary>本作品的发包记录</summary>
+          <div id="review-history-list" class="review-history-list"></div>
+        </details>
       </section>
 
               <div class="table-wrap">

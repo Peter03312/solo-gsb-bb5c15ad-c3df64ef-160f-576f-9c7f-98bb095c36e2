@@ -12,6 +12,9 @@ const state = {
   shiftPreview: null,
   // 当前作品的候选提案（含已结案，前端按勾选过滤展示）
   proposals: [],
+  // 离线校订包：已选择的文件内容与最近一次预览
+  reviewFile: { name: '', content: '' },
+  reviewPreview: null,
 };
 
 $('#editor-name').value = state.editor;
@@ -154,6 +157,19 @@ async function openWork(id) {
   $('#proposal-msg').className = 'msg';
   $('#proposal-msg').textContent = '';
   $('#proposal-count').textContent = '0';
+
+  $('#review-panel').hidden = true;
+  $('#review-file').value = '';
+  $('#review-picked').textContent = '';
+  $('#review-msg').className = 'msg';
+  $('#review-msg').textContent = '';
+  $('#review-summary').hidden = true;
+  $('#review-summary').textContent = '';
+  $('#review-tbody').innerHTML = '';
+  $('#review-apply-btn').disabled = true;
+  $('#review-rev').textContent = '';
+  state.reviewFile = { name: '', content: '' };
+  state.reviewPreview = null;
 
   $('#work-title-display').textContent = r.work.title;
   $('#work-filename').textContent = r.work.filename;
@@ -871,6 +887,365 @@ $('#shift-confirm-btn').addEventListener('click', async () => {
     }
   }
 });
+
+/* ------------------------------------------------------------------ */
+/* 离线校订包：下载发包 / 选择回传文件 / 预览差异 / 确认应用           */
+/* ------------------------------------------------------------------ */
+
+function setReviewMsg(kind, text) {
+  const el = $('#review-msg');
+  el.className = `msg ${kind || ''}`;
+  el.textContent = text;
+}
+
+/** 下载离线校订包：POST 发包（留存基线）后用返回内容生成本地文件 */
+$('#issue-package').addEventListener('click', async () => {
+  if (!state.current) return;
+  const btn = $('#issue-package');
+  btn.disabled = true;
+  try {
+    const r = await api(
+      'POST',
+      `/api/works/${state.current.work.id}/review-packages`,
+      { editor: state.editor || null }
+    );
+    const safeTitle = (state.current.work.title || 'work')
+      .replace(/[\\/:*?"<>|\x00-\x1f]/g, '_')
+      .replace(/\s+/g, ' ')
+      .slice(0, 100);
+    const blob = new Blob([r.content], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${safeTitle}.review.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    setReviewMsg(
+      'ok',
+      `校订包 ${r.package.package_id} 已下载（基线修订号 ${r.package.base_revision}，共 ${r.package.cue_count} 段）。` +
+        '离线修改 start/end/text 后，在下方选择文件回传。'
+    );
+    $('#review-panel').hidden = false;
+    await loadReviewHistory();
+  } catch (err) {
+    setReviewMsg('error', err.message);
+    $('#review-panel').hidden = false;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('#review-toggle').addEventListener('click', async () => {
+  const panel = $('#review-panel');
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden) await loadReviewHistory().catch(() => {});
+});
+
+$('#review-refresh').addEventListener('click', () => {
+  $('#review-panel').hidden = false;
+  loadReviewHistory().catch((err) => setReviewMsg('error', err.message));
+});
+
+$('#review-file').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  state.reviewPreview = null;
+  $('#review-apply-btn').disabled = true;
+  $('#review-tbody').innerHTML = '';
+  $('#review-summary').hidden = true;
+  if (!file) {
+    state.reviewFile = { name: '', content: '' };
+    $('#review-picked').textContent = '';
+    return;
+  }
+  try {
+    state.reviewFile = { name: file.name, content: await file.text() };
+    $('#review-picked').textContent = `已选择：${file.name}（${file.size} 字节）`;
+    setReviewMsg('', '');
+  } catch (err) {
+    setReviewMsg('error', `读取文件失败：${err.message}`);
+  }
+});
+
+function reviewTimeCell(value) {
+  const div = document.createElement('div');
+  if (!value) {
+    div.textContent = '（段已不存在）';
+    return div;
+  }
+  const tc = document.createElement('div');
+  tc.className = 'tc';
+  tc.textContent = `${value.start} --> ${value.end}`;
+  const tx = document.createElement('div');
+  tx.className = 'tx';
+  tx.textContent = value.text !== undefined ? value.text : '';
+  div.append(tc, tx);
+  return div;
+}
+
+function renderReviewPreview(r) {
+  const tbody = $('#review-tbody');
+  tbody.innerHTML = '';
+
+  for (const c of r.cues) {
+    const tr = document.createElement('tr');
+    const conflict = c.conflict;
+    const invalid = c.issues.some((t) => t === 'negative_time' || t === 'invalid_range');
+    const overlap = c.issues.includes('overlap');
+    if (!c.changed) tr.className = 'rev-unchanged';
+    else if (conflict) tr.className = 'rev-conflict';
+    else if (invalid || overlap) tr.className = 'rev-bad';
+    else tr.className = 'rev-ok';
+
+    const idxTd = document.createElement('td');
+    idxTd.className = 'col-idx';
+    idxTd.textContent = c.idx ? `#${c.idx}` : '—';
+    idxTd.title = `稳定段 ID ${c.cue_id}`;
+
+    const baseTd = document.createElement('td');
+    baseTd.className = 'rev-cell';
+    baseTd.appendChild(reviewTimeCell(c.baseline));
+
+    const candTd = document.createElement('td');
+    candTd.className = 'rev-cell';
+    const candLabel = document.createElement('span');
+    candLabel.className = 'label';
+    candLabel.textContent = '离线修改';
+    candTd.appendChild(candLabel);
+    candTd.appendChild(reviewTimeCell(c.candidate));
+
+    const curTd = document.createElement('td');
+    curTd.className = 'rev-cell';
+    curTd.appendChild(reviewTimeCell(c.current));
+    const badges = document.createElement('div');
+    badges.className = 'rev-badges';
+    const addBadge = (cls, text, title) => {
+      const b = document.createElement('span');
+      b.className = `rev-badge ${cls}`;
+      b.textContent = text;
+      if (title) b.title = title;
+      badges.appendChild(b);
+    };
+
+    if (!c.changed) {
+      addBadge('same', '未改：保持正式段');
+      if (r.unchanged_drifted.includes(c.cue_id)) {
+        addBadge('drifted', '正式段已变（不覆盖）');
+      }
+    } else if (conflict) {
+      const label =
+        conflict.reason === 'target_missing'
+          ? '冲突：目标段缺失'
+          : conflict.reason === 'baseline_missing'
+            ? '冲突：不在发包基线'
+            : '冲突：目标段已变';
+      addBadge('conflict', label, conflict.message);
+    } else {
+      addBadge('changed', '改过：将写入');
+      if (invalid) addBadge('invalid', c.issues.includes('negative_time') ? '负时间' : '区间无效');
+      if (overlap) addBadge('overlap', `交叠 ${c.collisions.length} 段`);
+    }
+    curTd.appendChild(badges);
+
+    tr.append(idxTd, baseTd, candTd, curTd);
+    tbody.appendChild(tr);
+  }
+}
+
+function showReviewSummary(r) {
+  const sum = $('#review-summary');
+  const lines = [];
+  if (r.used) {
+    lines.push(`⚠ 校订包已标记为「已使用」，不能重复确认。`);
+  }
+  lines.push(
+    `改过 ${r.changed_count} 段、未改 ${r.unchanged_count} 段` +
+      (r.unchanged_drifted.length
+        ? `（其中 ${r.unchanged_drifted.length} 个未改段的正式值已变，将保持服务器现状）`
+        : '')
+  );
+  if (r.package && r.package.drifted_from_baseline) {
+    lines.push(
+      `作品在发包（修订号 ${r.package.base_revision}）后已有改动，当前修订号 ${r.revision}；` +
+        '未改段不覆盖，改过的段必须仍与基线一致才能应用。'
+    );
+  }
+  if (r.no_changes) lines.push('包中没有相对基线改过的段，无需应用。');
+  if (r.conflicts.length > 0) {
+    lines.push(`冲突 ${r.conflicts.length} 处：` + r.conflicts
+      .map((c) => `段 ID ${c.cue_id} ${c.message}`).join('；'));
+  }
+  if (r.issues.length > 0) {
+    lines.push('整批应用违例：');
+    for (const issue of r.issues) lines.push(`· [${issue.type}] ${issue.message}`);
+  }
+  if (r.valid) {
+    lines.push(`检查通过：确认后将一次性写入 ${r.changed_count} 段，修订号推进到 ${r.revision + 1} 并重排序号。`);
+  }
+  sum.hidden = false;
+  sum.className = `review-summary ${r.valid ? 'ok' : 'bad'}`;
+  sum.textContent = lines.join('\n');
+}
+
+async function previewReview() {
+  if (!state.current) return;
+  if (!state.reviewFile.content) {
+    throw new Error('请先选择离线修改后的校订包 JSON 文件');
+  }
+  setReviewMsg('', '预览中…');
+  const r = await api(
+    'POST',
+    `/api/works/${state.current.work.id}/review-packages/preview`,
+    { content: state.reviewFile.content }
+  );
+  state.reviewPreview = r;
+  renderReviewPreview(r);
+  showReviewSummary(r);
+  $('#review-rev').textContent =
+    `包 ${r.package.package_id} · 基线修订 ${r.package.base_revision} · 当前修订 ${r.revision}`;
+  $('#review-rev').className = `review-rev${r.valid ? '' : ' bad'}`;
+  $('#review-apply-btn').disabled = !r.valid;
+  setReviewMsg(
+    r.valid ? 'ok' : 'error',
+    r.used
+      ? '该包已使用，不能再次确认。'
+      : r.valid
+        ? '预览通过，可确认应用。'
+        : r.no_changes
+          ? '没有相对基线改过的段。'
+          : '存在冲突或违例，整包将无法应用；请修正离线文件后重新预览。'
+  );
+}
+
+$('#review-preview-btn').addEventListener('click', async () => {
+  try {
+    await previewReview();
+  } catch (err) {
+    state.reviewPreview = null;
+    $('#review-apply-btn').disabled = true;
+    $('#review-tbody').innerHTML = '';
+    $('#review-summary').hidden = true;
+    $('#review-rev').textContent = '';
+    setReviewMsg('error', err.message);
+  }
+});
+
+$('#review-apply-btn').addEventListener('click', async () => {
+  if (!state.current || !state.reviewPreview) return;
+  const p = state.reviewPreview;
+  if (
+    !confirm(
+      `确认把校订包中改过的 ${p.changed_count} 段写入作品「${state.current.work.title}」？\n` +
+        '未改段保持服务器现状；成功后修订号推进、展示序号重排，且该包标记为已使用。'
+    )
+  ) {
+    return;
+  }
+  const btn = $('#review-apply-btn');
+  btn.disabled = true;
+  try {
+    const r = await api(
+      'POST',
+      `/api/works/${state.current.work.id}/review-packages/${p.package.package_id}/apply`,
+      { content: state.reviewFile.content, editor: state.editor || null }
+    );
+    setReviewMsg(
+      'ok',
+      `校订包已应用：写入 ${r.applied_count} 段，修订号推进到 ${r.revision}，展示序号已重排。`
+    );
+    state.reviewPreview = null;
+    await loadReviewHistory();
+    await openWork(state.current.work.id);
+    $('#review-panel').hidden = false;
+    setReviewMsg(
+      'ok',
+      `校订包已应用：写入 ${r.applied_count} 段，修订号推进到 ${r.revision}，展示序号已重排。`
+    );
+  } catch (err) {
+    if (err.status === 409 && err.data.error === 'review_conflict') {
+      // 确认时的最新核对发现冲突/违例：整包未写，用返回数据重新渲染，包可再预览
+      const cues = err.data.cues || [];
+      const sameAsBaseline = (e) =>
+        e.current &&
+        e.current.start_ms === e.baseline.start_ms &&
+        e.current.end_ms === e.baseline.end_ms &&
+        e.current.text === e.baseline.text;
+      state.reviewPreview = {
+        ...err.data,
+        package: state.reviewPreview.package,
+        valid: false,
+        used: false,
+        no_changes: false,
+        changed_count: cues.filter((c) => c.changed).length,
+        unchanged_count: cues.filter((c) => !c.changed).length,
+        unchanged_drifted: cues
+          .filter((c) => !c.changed && !sameAsBaseline(c))
+          .map((c) => c.cue_id),
+      };
+      renderReviewPreview(state.reviewPreview);
+      showReviewSummary(state.reviewPreview);
+      setReviewMsg(
+        'error',
+        `确认时按最新正式段重新核对发现问题，整包未写入：${err.data.message}。修正离线文件后可重新预览。`
+      );
+    } else {
+      setReviewMsg('error', err.message);
+    }
+    btn.disabled = false;
+  }
+});
+
+$('#review-clear-btn').addEventListener('click', () => {
+  state.reviewPreview = null;
+  state.reviewFile = { name: '', content: '' };
+  $('#review-file').value = '';
+  $('#review-picked').textContent = '';
+  $('#review-tbody').innerHTML = '';
+  $('#review-summary').hidden = true;
+  $('#review-apply-btn').disabled = true;
+  $('#review-rev').textContent = '';
+  setReviewMsg('', '');
+});
+
+/** 发包记录列表（支持再次下载同一个包文件） */
+async function loadReviewHistory() {
+  if (!state.current) return;
+  const el = $('#review-history-list');
+  el.textContent = '加载中…';
+  try {
+    const r = await api(
+      'GET',
+      `/api/works/${state.current.work.id}/review-packages?status=all`
+    );
+    el.innerHTML = '';
+    if (r.packages.length === 0) {
+      el.textContent = '还没有发过校订包。';
+      return;
+    }
+    for (const p of r.packages) {
+      const row = document.createElement('div');
+      row.className = 'rh-row';
+      const badge = document.createElement('span');
+      badge.className = `rh-badge ${p.status}`;
+      badge.textContent = p.status === 'issued' ? '未使用' : '已使用';
+      const who = document.createElement('span');
+      who.textContent = p.editor || '（未署名）';
+      const uid = document.createElement('span');
+      uid.className = 'rh-uid';
+      uid.textContent = `${p.package_id} · 基线修订 ${p.base_revision} · ${p.cue_count} 段 · ${p.created_at}`;
+      row.append(badge, who, uid);
+      const dl = document.createElement('a');
+      dl.className = 'button rh-dl';
+      dl.href = `/api/works/${state.current.work.id}/review-packages/${p.package_id}/file`;
+      dl.textContent = '重新下载';
+      row.appendChild(dl);
+      el.appendChild(row);
+    }
+  } catch (err) {
+    el.textContent = `加载失败：${err.message}`;
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* 离开页面前提醒未保存修改                                            */

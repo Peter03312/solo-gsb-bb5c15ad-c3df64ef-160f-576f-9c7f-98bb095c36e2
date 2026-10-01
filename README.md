@@ -35,6 +35,15 @@
 - **时间约束**：结束必须晚于开始（时间不可为负），新时间段与同作品其他字幕段
   不得交叠（相邻段首尾相接允许）。批量平移时任一新起点为负、选中段彼此或与
   未选段交叠，都**整批拒绝**并指出原因与相关段；违例保存不推进修订号。
+- **离线校订包**：校订人员可把作品字幕下载为离线校订包（JSON，含作品标识、
+  包标识、稳定段 ID、可编辑起止时间与多行文字），服务端在发包时留存各段基线。
+  离线改完回传后**先预览**：逐段对照基线/离线候选/当前正式值，标出改过与未改段、
+  目标段发包后已变或缺失、以及整批应用后的负时间、无效区间与交叠。**确认时**
+  服务器在同一事务内按最新正式段重新核对：只写入相对基线改过的段（未改段即使
+  服务器后来变化也不覆盖），任一冲突或违例则**整包不写**并返回段 ID 与原因、
+  包仍可重新预览；成功才一次性推进作品修订号、重排展示序号并把包标记为已使用
+  （重复确认拒绝）。无效包、跨作品包、路径与包内标识不一致、字段非法都明确
+  拒绝且不写入。
 - **导出标准 SRT**：按开始时间重新从 1 连续编号，文字多行换行原样保留，
   输出带 UTF-8 BOM 的标准 SRT 文件。
 
@@ -122,7 +131,10 @@ npm test
 （负起点/交叠/首尾相接）、批量确认单事务重算与重排、过期预览 409、
 候选提案提交（过期/非法不生成提案）、采纳（快照一致校验、交叠复查、
 重排序号、目标已变/交叠冲突保留待审）、驳回结案与结案后不可再处理、
-导出重新编号与换行保留、重启持久化等 45 个用例。
+离线校订包（包格式校验、发包基线、逐段差异预览、未改段不覆盖、目标已变/
+缺失冲突、负时间/无效区间/交叠整批拒绝、确认单事务核对、修订号推进与重排、
+包标记已用与重复确认拒绝、无效包/跨作品包拒绝）、导出重新编号与换行保留、
+重启持久化等 60 个用例。
 
 ## HTTP 接口摘要
 
@@ -138,6 +150,11 @@ npm test
 | `POST` | `/api/works/:id/proposals/:pid/reject` | 驳回候选：`{editor?}`；只结案，不动正式段与修订号；已结案 `409 proposal_closed` |
 | `POST` | `/api/works/:id/cues/shift/preview` | 批量平移预览（不写库），见下 |
 | `POST` | `/api/works/:id/cues/shift` | 确认批量平移：同事务重算应用、修订号 +1、重排展示序号；过期 `409 {latest_revision}`，非法 `422 {issues, cues}` |
+| `POST` | `/api/works/:id/review-packages` | 生成离线校订包：留存各段基线，返回包元数据与可保存的 JSON 文件内容；不推进修订号 |
+| `GET` | `/api/works/:id/review-packages?status=issued\|used\|all` | 本作品发包记录（含已用/未用状态、基线修订号、段数） |
+| `GET` | `/api/works/:id/review-packages/:uid/file` | 下载校订包文件（`<标题>.review.json`）；跨作品访问 `400 cross_work_package` |
+| `POST` | `/api/works/:id/review-packages/preview` | 导入预览：`{content}`，逐段差异 + 冲突 + 整批违例，不写库 |
+| `POST` | `/api/works/:id/review-packages/:uid/apply` | 确认应用：单事务按最新正式段核对；成功推进修订号/重排/标记已用，冲突 `409 review_conflict`，重复确认 `409 package_used` |
 | `GET` | `/api/works/:id/export` | 下载按时间重新编号的标准 SRT |
 | `DELETE` | `/api/works/:id` | 删除作品及其全部字幕段 |
 
@@ -324,6 +341,127 @@ curl -X POST http://localhost:3000/api/works/1/proposals/2/reject \
 只把提案结案为 `rejected`（记录审阅者与结案时间），正式段与作品修订号不变。
 已结案提案再次采纳/驳回均返回 `409 proposal_closed`。
 
+## 离线校订包 API
+
+校订人员需要带走字幕离线修改、再把改动回传同一作品时使用校订包。包是一份
+UTF-8 JSON 文件（浏览器下载为 `<标题>.review.json`），顶层固定为：
+
+```json
+{
+  "format": "srt-review-package",
+  "version": 1,
+  "work_id": 3,
+  "package_id": "rv_P0Ab3Q_8NKb_urdG",
+  "base_revision": 1,
+  "created_at": "2026-10-01 11:07:18",
+  "cues": [
+    { "cue_id": 7, "start": "00:00:01,000", "end": "00:00:02,000", "text": "甲\n第二行" }
+  ]
+}
+```
+
+- `work_id` 是**作品标识**，`package_id` 是**包标识**（一个包全生命周期不变），
+  `cue_id` 是**稳定段 ID**（展示序号重排也不变）。
+- 离线只编辑每段的 `start`、`end`（`HH:MM:SS,mmm`，负时间也可填，会在预览/确认
+  时作为违例报告）与 `text`（多行用 `\n` 换行；也支持把文字写成
+  `text_lines: ["第一行", "第二行"]`）。**不要改动三个标识字段。**
+- 服务端发包时把当时每段时间与文字作为**基线**留存。导入时只处理相对基线
+  改过的段；未改段即使服务器后来被在线编辑、平移或采纳候选改过，也**不覆盖**。
+
+### 1) 发包 `POST /api/works/:id/review-packages`
+
+```bash
+curl -X POST http://localhost:3000/api/works/3/review-packages \
+  -H 'Content-Type: application/json' \
+  -d '{"editor":"校对甲"}'
+```
+
+返回 `201`：`package` 为包元数据（`package_id`、`base_revision`、`cue_count`、
+`status:"issued"`），`content` 是可直接存盘的校订包 JSON 文本。发包**不改变**
+正式段与修订号。浏览器点「下载校订包」即调此接口并把 `content` 存为文件。
+
+也可用 `GET /api/works/:id/review-packages/:uid/file` 直接下载同一文件
+（Content-Disposition 附件），用 `GET /api/works/:id/review-packages?status=all`
+查看发包记录。
+
+### 2) 预览 `POST /api/works/:id/review-packages/preview`
+
+离线改好后回传文件内容（JSON 字符串放 `content`；也可直接把包对象作为请求体）：
+
+```bash
+curl -X POST http://localhost:3000/api/works/3/review-packages/preview \
+  -H 'Content-Type: application/json' \
+  --data-binary @<(jq -Rs '{content: .}' 演示片.review.json)
+```
+
+返回（不写库）：
+
+```json
+{
+  "package": { "package_id": "rv_…", "base_revision": 1, "current_revision": 2,
+               "drifted_from_baseline": true, "status": "issued" },
+  "revision": 2,
+  "valid": false,
+  "used": false,
+  "no_changes": false,
+  "changed_count": 2,
+  "unchanged_count": 1,
+  "unchanged_drifted": [8],
+  "conflicts": [
+    { "cue_id": 9, "reason": "target_missing",
+      "message": "目标字幕段已不存在", "current": null }
+  ],
+  "issues": [
+    { "type": "overlap", "cue_ids": [7, 8],
+      "message": "段 ID 7（展示序号 #1）候选为 ……，与 1 个字幕段交叠：#2（首尾相接不算交叠）" }
+  ],
+  "cues": [
+    { "cue_id": 7, "idx": 1, "changed": true,
+      "baseline":  { "start": "00:00:01,000", "end": "00:00:02,000", "text": "甲" },
+      "candidate": { "start": "00:00:01,000", "end": "00:00:01,800", "text": "甲离线" },
+      "current":   { "id": 7, "idx": 1, "start": "00:00:01,000", "end": "00:00:02,000", "text": "甲" },
+      "conflict": null, "issues": ["overlap"], "collisions": [ { "id": 8, "idx": 2 } ] }
+  ]
+}
+```
+
+- `conflicts[].reason`：`target_changed`（改过的目标段正式值已偏离基线）、
+  `target_missing`（目标段已删除）、`baseline_missing`（包中段不在本包基线中）。
+- `issues[].type`：`negative_time`（候选起点/终点为负）、`invalid_range`
+  （结束不晚于开始）、`overlap`（整批应用后与其他段交叠，含两个改动段彼此交叠；
+  首尾相接不算）。
+- `unchanged_drifted`：未改但正式值已偏离基线的段 ID，仅提示，应用时保持服务器现状。
+- `valid` 为 true 必须满足：无冲突、无违例、包未使用且至少有一段改过。
+
+### 3) 确认 `POST /api/works/:id/review-packages/:uid/apply`
+
+```bash
+curl -X POST http://localhost:3000/api/works/3/review-packages/rv_P0Ab3Q_8NKb_urdG/apply \
+  -H 'Content-Type: application/json' \
+  --data-binary @<(jq -Rs '{content: ., editor: "校对甲"}' 演示片.review.json)
+```
+
+服务器在**同一事务**内：按最新正式段重新加载并核对每个改过的段仍与基线一致 →
+重算负时间/无效区间/交叠 → 只更新改过且通过的段 → 作品修订号 **+1** →
+重排全部展示序号 → 把包标记为 `used`。成功返回
+`{revision, applied_count, cues, package}`。
+
+- 有冲突或违例：`409 {"error":"review_conflict","conflicts":[...],"issues":[...],
+  "cues":[...],"revision":N}`，**整包不写**、包仍是 `issued`，修正离线文件后可
+  重新预览/确认。
+- 包已使用再次确认：`409 {"error":"package_used","status":"used"}`。
+- 没有任何相对基线改过的段：`422 {"error":"no_changes"}`。
+- 预览后到确认前作品被他人改动：未改段照常保持服务器现状；改过的段只要仍与
+  基线一致就可应用（不依赖作品修订号），已偏离基线的改过段则在确认时被拦下。
+
+### 4) 无效包 / 跨作品包 / 字段非法
+
+以下情况一律 `400 invalid_package`（附 `field`/`cue_id`）或 `404 package_not_found`，
+**不写入任何内容**：请求体不是合法 JSON、`format`/`version` 不符、`work_id`/
+`package_id` 非法、`cues` 缺失/为空、段 ID 非法或重复、时间无法解析、文字为空
+或超长；包文件属于其他作品返回 `400 cross_work_package`（附
+`package_work_id`）；路径包标识与文件内不一致返回 `400 package_mismatch`。
+
 ## 目录结构
 
 ```
@@ -333,8 +471,9 @@ curl -X POST http://localhost:3000/api/works/1/proposals/2/reject \
 ├── package.json
 ├── README.md
 ├── src/
-│   ├── server.js      # Express 路由：上传/编辑/待审区/批量平移/导出、乐观锁与交叠校验
+│   ├── server.js      # Express 路由：上传/编辑/待审区/批量平移/离线校订包/导出、乐观锁与交叠校验
 │   ├── shift.js       # 批量平移推演（负起点/交叠检测，碰撞对象）
+│   ├── review.js      # 离线校订包：文件格式、解析校验、基线差异与整批应用预案（纯函数）
 │   ├── db.js          # SQLite 存储（sql.js wasm，快照持久化，建表初始化）
 │   └── srt.js         # SRT 严格解析（带行号报错）与标准序列化
 ├── public/            # 浏览器界面（原生 HTML/CSS/JS）
@@ -359,4 +498,12 @@ curl -X POST http://localhost:3000/api/works/1/proposals/2/reject \
    绿色表示可应用，红色会逐条指出负起点/交叠及相关段。点「确认应用」整批
    同量平移，修订号只增加一次、展示序号自动重排；若预览后作品被他人改动，
    会收到 409 提示，重新载入并重新预览即可；
-6. 校订完成后点右上角「导出标准 SRT」，文件可直接用于放映软件。
+6. 需要把字幕带走离线修改时，点右上角「下载校订包」得到 `<标题>.review.json`
+   （服务端同时留存发包基线）。离线用任意文本编辑器改每段的 `start`/`end`/`text`，
+   不要动 `work_id`/`package_id`/`cue_id`。回来后在「导入离线校订包」面板选择
+   文件并「预览差异」：逐段对照基线、离线候选与当前正式值，目标段已变/缺失、
+   负时间、无效区间、交叠都会标出；未改段即使服务器有新改动也不会被覆盖。
+   点「确认应用整包」：服务器在同一事务内按最新正式段重新核对，任一冲突都
+   整包不写（包保留，可改好再预览），成功才推进修订号、重排序号并把包标记为
+   已使用（同一包不能重复确认，需要再次离线校订请重新发包）；
+7. 校订完成后点右上角「导出标准 SRT」，文件可直接用于放映软件。
